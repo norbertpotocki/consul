@@ -259,6 +259,8 @@ type NodeService struct {
 	Tags    []string
 	Address string
 	Port    int
+
+	Index
 }
 type NodeServices struct {
 	Node     Node
