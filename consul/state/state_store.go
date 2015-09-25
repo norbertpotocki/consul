@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/go-memdb"
@@ -34,10 +35,21 @@ var (
 // pairs and more. The DB is entirely in-memory and is constructed
 // from the Raft log through the FSM.
 type StateStore struct {
-	logger  *log.Logger // TODO(slackpad) - Delete if unused!
-	schema  *memdb.DBSchema
-	db      *memdb.MemDB
-	watches map[string]WatchManager
+	logger *log.Logger // TODO(slackpad) - Delete if unused!
+	schema *memdb.DBSchema
+	db     *memdb.MemDB
+
+	// tableWatches holds all the full table watches, indexed by table name.
+	tableWatches map[string]*FullTableWatch
+
+	// kvsWatch holds the special prefix watch for the key value store.
+	kvsWatch *PrefixWatch
+
+	// kvsGraveyard manages tombstones for the key value store.
+	kvsGraveyard *Graveyard
+
+	// lockDelay holds expiration times for locks associated with keys.
+	lockDelay *Delay
 }
 
 // StateSnapshot is used to provide a point-in-time snapshot. It
@@ -72,18 +84,25 @@ func NewStateStore(logOutput io.Writer) (*StateStore, error) {
 		return nil, fmt.Errorf("Failed setting up state store: %s", err)
 	}
 
-	// Build up the watch managers.
-	watches, err := newWatchManagers(schema)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to build watch managers: %s", err)
+	// Build up the all-table watches.
+	tableWatches := make(map[string]*FullTableWatch)
+	for table, _ := range schema.Tables {
+		if table == "kvs" {
+			continue
+		}
+
+		tableWatches[table] = NewFullTableWatch()
 	}
 
 	// Create and return the state store.
 	s := &StateStore{
-		logger:  log.New(logOutput, "", log.LstdFlags),
-		schema:  schema,
-		db:      db,
-		watches: watches,
+		logger:       log.New(logOutput, "", log.LstdFlags),
+		schema:       schema,
+		db:           db,
+		tableWatches: tableWatches,
+		kvsWatch:     NewPrefixWatch(),
+		kvsGraveyard: NewGraveyard("kvs"),
+		lockDelay:    NewDelay(),
 	}
 	return s, nil
 }
@@ -111,8 +130,25 @@ func (s *StateSnapshot) Close() {
 	s.tx.Abort()
 }
 
-// ACLList is used to pull all the ACLs from the snapshot.
-func (s *StateSnapshot) ACLList() ([]*structs.ACL, error) {
+// KVSDump is used to pull the full list of KVS entries for use during
+// snapshots.
+func (s *StateSnapshot) KVSDump() ([]*structs.DirEntry, error) {
+	// Query an empty prefix to get the full list of keys.
+	entries, err := s.tx.Get("kvs", "id_prefix", "")
+	if err != nil {
+		return nil, fmt.Errorf("failed kvs lookup: %s", err)
+	}
+
+	// Convert to the output format.
+	var dump []*structs.DirEntry
+	for entry := entries.Next(); entry != nil; entry = entries.Next() {
+		dump = append(dump, entry.(*structs.DirEntry))
+	}
+	return dump, nil
+}
+
+// ACLDump is used to pull all the ACLs from the snapshot.
+func (s *StateSnapshot) ACLDump() ([]*structs.ACL, error) {
 	_, ret, err := aclListTxn(s.tx)
 	return ret, err
 }
@@ -134,7 +170,7 @@ func maxIndexTxn(tx *memdb.Txn, tables ...string) uint64 {
 		if err != nil {
 			panic(fmt.Sprintf("unknown index: %s", table))
 		}
-		if idx, ok := ti.(*IndexEntry); ok && idx.Value > lindex {
+		if idx := ti.(*IndexEntry); idx.Value > lindex {
 			lindex = idx.Value
 		}
 	}
@@ -143,7 +179,7 @@ func maxIndexTxn(tx *memdb.Txn, tables ...string) uint64 {
 
 // indexUpdateMaxTxn is used when restoring entries and sets the table's index to
 // the given idx only if it's greater than the current index.
-func indexUpdateMaxTxn(tx *memdb.Txn, idx uint64, table string) error {
+func (s *StateStore) indexUpdateMaxTxn(tx *memdb.Txn, idx uint64, table string) error {
 	raw, err := tx.First("index", "id", table)
 	if err != nil {
 		return fmt.Errorf("failed to retrieve existing index: %s", err)
@@ -153,12 +189,7 @@ func indexUpdateMaxTxn(tx *memdb.Txn, idx uint64, table string) error {
 		return fmt.Errorf("missing index for table %s", table)
 	}
 
-	entry, ok := raw.(*IndexEntry)
-	if !ok {
-		return fmt.Errorf("unexpected index type for table %s", table)
-	}
-
-	if idx > entry.Value {
+	if idx > raw.(*IndexEntry).Value {
 		if err := tx.Insert("index", &IndexEntry{table, idx}); err != nil {
 			return fmt.Errorf("failed updating index %s", err)
 		}
@@ -167,16 +198,18 @@ func indexUpdateMaxTxn(tx *memdb.Txn, idx uint64, table string) error {
 	return nil
 }
 
-// getWatchManager returns a watch manager for the given set of tables. The
-// order of the tables is not important.
-func (s *StateStore) GetWatchManager(tables ...string) WatchManager {
-	if len(tables) == 1 {
-		if manager, ok := s.watches[tables[0]]; ok {
-			return manager
-		}
+// GetTableWatch returns a watch for the given table.
+func (s *StateStore) GetTableWatch(table string) Watch {
+	if watch, ok := s.tableWatches[table]; ok {
+		return watch
 	}
 
-	panic(fmt.Sprintf("Unknown watch manager(s): %v", tables))
+	panic(fmt.Sprintf("Unknown watch for table %#s", table))
+}
+
+// GetKVSWatch returns a watch for the given prefix in the key value store.
+func (s *StateStore) GetKVSWatch(prefix string) Watch {
+	return s.kvsWatch.GetSubwatch(prefix)
 }
 
 // EnsureNode is used to upsert node registration or modification.
@@ -185,7 +218,7 @@ func (s *StateStore) EnsureNode(idx uint64, node *structs.Node) error {
 	defer tx.Abort()
 
 	// Call the node upsert
-	if err := ensureNodeTxn(tx, idx, node); err != nil {
+	if err := s.ensureNodeTxn(tx, idx, node); err != nil {
 		return err
 	}
 
@@ -196,7 +229,7 @@ func (s *StateStore) EnsureNode(idx uint64, node *structs.Node) error {
 // ensureNodeTxn is the inner function called to actually create a node
 // registration or modify an existing one in the state store. It allows
 // passing in a memdb transaction so it may be part of a larger txn.
-func ensureNodeTxn(tx *memdb.Txn, idx uint64, node *structs.Node) error {
+func (s *StateStore) ensureNodeTxn(tx *memdb.Txn, idx uint64, node *structs.Node) error {
 	// Check for an existing node
 	existing, err := tx.First("nodes", "id", node.Node)
 	if err != nil {
@@ -269,7 +302,7 @@ func (s *StateStore) DeleteNode(idx uint64, nodeID string) error {
 	defer tx.Abort()
 
 	// Call the node deletion.
-	if err := deleteNodeTxn(tx, idx, nodeID); err != nil {
+	if err := s.deleteNodeTxn(tx, idx, nodeID); err != nil {
 		return err
 	}
 
@@ -279,7 +312,7 @@ func (s *StateStore) DeleteNode(idx uint64, nodeID string) error {
 
 // deleteNodeTxn is the inner method used for removing a node from
 // the store within a given transaction.
-func deleteNodeTxn(tx *memdb.Txn, idx uint64, nodeID string) error {
+func (s *StateStore) deleteNodeTxn(tx *memdb.Txn, idx uint64, nodeID string) error {
 	// Look up the node
 	node, err := tx.First("nodes", "id", nodeID)
 	if err != nil {
@@ -296,7 +329,7 @@ func deleteNodeTxn(tx *memdb.Txn, idx uint64, nodeID string) error {
 	}
 	for service := services.Next(); service != nil; service = services.Next() {
 		svc := service.(*structs.ServiceNode)
-		if err := deleteServiceTxn(tx, idx, nodeID, svc.ServiceID); err != nil {
+		if err := s.deleteServiceTxn(tx, idx, nodeID, svc.ServiceID); err != nil {
 			return err
 		}
 	}
@@ -308,7 +341,7 @@ func deleteNodeTxn(tx *memdb.Txn, idx uint64, nodeID string) error {
 	}
 	for check := checks.Next(); check != nil; check = checks.Next() {
 		chk := check.(*structs.HealthCheck)
-		if err := deleteCheckTxn(tx, idx, nodeID, chk.CheckID); err != nil {
+		if err := s.deleteCheckTxn(tx, idx, nodeID, chk.CheckID); err != nil {
 			return err
 		}
 	}
@@ -332,7 +365,7 @@ func (s *StateStore) EnsureService(idx uint64, node string, svc *structs.NodeSer
 	defer tx.Abort()
 
 	// Call the service registration upsert
-	if err := ensureServiceTxn(tx, idx, node, svc); err != nil {
+	if err := s.ensureServiceTxn(tx, idx, node, svc); err != nil {
 		return err
 	}
 
@@ -342,7 +375,7 @@ func (s *StateStore) EnsureService(idx uint64, node string, svc *structs.NodeSer
 
 // ensureServiceTxn is used to upsert a service registration within an
 // existing memdb transaction.
-func ensureServiceTxn(tx *memdb.Txn, idx uint64, node string, svc *structs.NodeService) error {
+func (s *StateStore) ensureServiceTxn(tx *memdb.Txn, idx uint64, node string, svc *structs.NodeService) error {
 	// Check for existing service
 	existing, err := tx.First("services", "id", node, svc.Service)
 	if err != nil {
@@ -448,7 +481,7 @@ func (s *StateStore) DeleteService(idx uint64, nodeID, serviceID string) error {
 	defer tx.Abort()
 
 	// Call the service deletion
-	if err := deleteServiceTxn(tx, idx, nodeID, serviceID); err != nil {
+	if err := s.deleteServiceTxn(tx, idx, nodeID, serviceID); err != nil {
 		return err
 	}
 
@@ -458,7 +491,7 @@ func (s *StateStore) DeleteService(idx uint64, nodeID, serviceID string) error {
 
 // deleteServiceTxn is the inner method called to remove a service
 // registration within an existing transaction.
-func deleteServiceTxn(tx *memdb.Txn, idx uint64, nodeID, serviceID string) error {
+func (s *StateStore) deleteServiceTxn(tx *memdb.Txn, idx uint64, nodeID, serviceID string) error {
 	// Look up the service
 	service, err := tx.First("services", "id", nodeID, serviceID)
 	if err != nil {
@@ -501,7 +534,7 @@ func (s *StateStore) EnsureCheck(idx uint64, hc *structs.HealthCheck) error {
 	defer tx.Abort()
 
 	// Call the check registration
-	if err := ensureCheckTxn(tx, idx, hc); err != nil {
+	if err := s.ensureCheckTxn(tx, idx, hc); err != nil {
 		return err
 	}
 
@@ -512,7 +545,7 @@ func (s *StateStore) EnsureCheck(idx uint64, hc *structs.HealthCheck) error {
 // ensureCheckTransaction is used as the inner method to handle inserting
 // a health check into the state store. It ensures safety against inserting
 // checks with no matching node or service.
-func ensureCheckTxn(tx *memdb.Txn, idx uint64, hc *structs.HealthCheck) error {
+func (s *StateStore) ensureCheckTxn(tx *memdb.Txn, idx uint64, hc *structs.HealthCheck) error {
 	// Check if we have an existing health check
 	existing, err := tx.First("checks", "id", hc.Node, hc.CheckID)
 	if err != nil {
@@ -631,7 +664,7 @@ func (s *StateStore) DeleteCheck(idx uint64, node, id string) error {
 	defer tx.Abort()
 
 	// Call the check deletion
-	if err := deleteCheckTxn(tx, idx, node, id); err != nil {
+	if err := s.deleteCheckTxn(tx, idx, node, id); err != nil {
 		return err
 	}
 
@@ -641,7 +674,7 @@ func (s *StateStore) DeleteCheck(idx uint64, node, id string) error {
 
 // deleteCheckTxn is the inner method used to call a health
 // check deletion within an existing transaction.
-func deleteCheckTxn(tx *memdb.Txn, idx uint64, node, id string) error {
+func (s *StateStore) deleteCheckTxn(tx *memdb.Txn, idx uint64, node, id string) error {
 	// Try to retrieve the existing health check
 	check, err := tx.First("checks", "id", node, id)
 	if err != nil {
@@ -833,13 +866,19 @@ func (s *StateStore) parseNodes(
 func (s *StateStore) KVSSet(idx uint64, entry *structs.DirEntry) error {
 	tx := s.db.Txn(true)
 	defer tx.Abort()
-	return kvsSetTxn(tx, idx, entry)
+
+	// Perform the actual set.
+	if err := s.kvsSetTxn(tx, idx, entry); err != nil {
+		return err
+	}
+
+	tx.Commit()
+	return nil
 }
 
 // kvsSetTxn is used to insert or update a key/value pair in the state
 // store. It is the inner method used and handles only the actual storage.
-func kvsSetTxn(tx *memdb.Txn, idx uint64, entry *structs.DirEntry) error {
-
+func (s *StateStore) kvsSetTxn(tx *memdb.Txn, idx uint64, entry *structs.DirEntry) error {
 	// Retrieve an existing KV pair
 	existing, err := tx.First("kvs", "id", entry.Key)
 	if err != nil {
@@ -863,7 +902,7 @@ func kvsSetTxn(tx *memdb.Txn, idx uint64, entry *structs.DirEntry) error {
 		return fmt.Errorf("failed updating index: %s", err)
 	}
 
-	tx.Commit()
+	tx.Defer(func() { s.kvsWatch.Notify(entry.Key, false) })
 	return nil
 }
 
@@ -904,6 +943,15 @@ func (s *StateStore) KVSList(prefix string) (uint64, []string, error) {
 		if e.ModifyIndex > lindex {
 			lindex = e.ModifyIndex
 		}
+	}
+
+	// Check for the highest index in the graveyard.
+	gindex, err := s.kvsGraveyard.GetMaxIndexTxn(tx, prefix)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed graveyard lookup: %s", err)
+	}
+	if gindex > lindex {
+		lindex = gindex
 	}
 	return lindex, keys, nil
 }
@@ -956,6 +1004,15 @@ func (s *StateStore) KVSListKeys(prefix, sep string) (uint64, []string, error) {
 			keys = append(keys, e.Key)
 		}
 	}
+
+	// Check for the highest index in the graveyard.
+	gindex, err := s.kvsGraveyard.GetMaxIndexTxn(tx, prefix)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed graveyard lookup: %s", err)
+	}
+	if gindex > lindex {
+		lindex = gindex
+	}
 	return lindex, keys, nil
 }
 
@@ -966,7 +1023,7 @@ func (s *StateStore) KVSDelete(idx uint64, key string) error {
 	defer tx.Abort()
 
 	// Perform the actual delete
-	if err := kvsDeleteTxn(tx, idx, key); err != nil {
+	if err := s.kvsDeleteTxn(tx, idx, key); err != nil {
 		return err
 	}
 
@@ -976,8 +1033,8 @@ func (s *StateStore) KVSDelete(idx uint64, key string) error {
 
 // kvsDeleteTxn is the inner method used to perform the actual deletion
 // of a key/value pair within an existing transaction.
-func kvsDeleteTxn(tx *memdb.Txn, idx uint64, key string) error {
-	// Look up the entry in the state store
+func (s *StateStore) kvsDeleteTxn(tx *memdb.Txn, idx uint64, key string) error {
+	// Look up the entry in the state store.
 	entry, err := tx.First("kvs", "id", key)
 	if err != nil {
 		return fmt.Errorf("failed kvs lookup: %s", err)
@@ -986,13 +1043,20 @@ func kvsDeleteTxn(tx *memdb.Txn, idx uint64, key string) error {
 		return nil
 	}
 
-	// Delete the entry and update the index
+	// Create a tombstone.
+	if err := s.kvsGraveyard.InsertTxn(tx, key, idx); err != nil {
+		return fmt.Errorf("failed adding to graveyard: %s", err)
+	}
+
+	// Delete the entry and update the index.
 	if err := tx.Delete("kvs", entry); err != nil {
 		return fmt.Errorf("failed deleting kvs entry: %s", err)
 	}
 	if err := tx.Insert("index", &IndexEntry{"kvs", idx}); err != nil {
 		return fmt.Errorf("failed updating index: %s", err)
 	}
+
+	tx.Defer(func() { s.kvsWatch.Notify(key, false) })
 	return nil
 }
 
@@ -1004,7 +1068,7 @@ func (s *StateStore) KVSDeleteCAS(idx, cidx uint64, key string) (bool, error) {
 	tx := s.db.Txn(true)
 	defer tx.Abort()
 
-	// Retrieve the existing kvs entry, if any exists
+	// Retrieve the existing kvs entry, if any exists.
 	entry, err := tx.First("kvs", "id", key)
 	if err != nil {
 		return false, fmt.Errorf("failed kvs lookup: %s", err)
@@ -1013,13 +1077,12 @@ func (s *StateStore) KVSDeleteCAS(idx, cidx uint64, key string) (bool, error) {
 	// If the existing index does not match the provided CAS
 	// index arg, then we shouldn't update anything and can safely
 	// return early here.
-	e, ok := entry.(*structs.DirEntry)
-	if !ok || e.ModifyIndex != cidx {
+	if entry.(*structs.DirEntry).ModifyIndex != cidx {
 		return entry == nil, nil
 	}
 
-	// Call the actual deletion if the above passed
-	if err := kvsDeleteTxn(tx, idx, key); err != nil {
+	// Call the actual deletion if the above passed.
+	if err := s.kvsDeleteTxn(tx, idx, key); err != nil {
 		return false, err
 	}
 
@@ -1035,7 +1098,7 @@ func (s *StateStore) KVSSetCAS(idx uint64, entry *structs.DirEntry) (bool, error
 	tx := s.db.Txn(true)
 	defer tx.Abort()
 
-	// Retrieve the existing entry
+	// Retrieve the existing entry.
 	existing, err := tx.First("kvs", "id", entry.Key)
 	if err != nil {
 		return false, fmt.Errorf("failed kvs lookup: %s", err)
@@ -1049,13 +1112,18 @@ func (s *StateStore) KVSSetCAS(idx uint64, entry *structs.DirEntry) (bool, error
 	if entry.ModifyIndex != 0 && existing == nil {
 		return false, nil
 	}
-	e, ok := existing.(*structs.DirEntry)
-	if ok && entry.ModifyIndex != 0 && entry.ModifyIndex != e.ModifyIndex {
+	e := existing.(*structs.DirEntry)
+	if entry.ModifyIndex != 0 && entry.ModifyIndex != e.ModifyIndex {
 		return false, nil
 	}
 
 	// If we made it this far, we should perform the set.
-	return true, kvsSetTxn(tx, idx, entry)
+	if err := s.kvsSetTxn(tx, idx, entry); err != nil {
+		return false, err
+	}
+
+	tx.Commit()
+	return true, nil
 }
 
 // KVSDeleteTree is used to do a recursive delete on a key prefix
@@ -1065,18 +1133,23 @@ func (s *StateStore) KVSDeleteTree(idx uint64, prefix string) error {
 	tx := s.db.Txn(true)
 	defer tx.Abort()
 
-	// Get an iterator over all of the keys with the given prefix
+	// Get an iterator over all of the keys with the given prefix.
 	entries, err := tx.Get("kvs", "id_prefix", prefix)
 	if err != nil {
 		return fmt.Errorf("failed kvs lookup: %s", err)
 	}
 
 	// Go over all of the keys and remove them. We call the delete
-	// directly so that we only update the index once.
+	// directly so that we only update the index once. We also add
+	// tombstones as we go.
 	var modified bool
 	for entry := entries.Next(); entry != nil; entry = entries.Next() {
-		err := tx.Delete("kvs", entry.(*structs.DirEntry))
-		if err != nil {
+		e := entry.(*structs.DirEntry)
+		if err := s.kvsGraveyard.InsertTxn(tx, e.Key, idx); err != nil {
+			return fmt.Errorf("failed adding to graveyard: %s", err)
+		}
+
+		if err := tx.Delete("kvs", e); err != nil {
 			return fmt.Errorf("failed deleting kvs entry: %s", err)
 		}
 		modified = true
@@ -1084,11 +1157,131 @@ func (s *StateStore) KVSDeleteTree(idx uint64, prefix string) error {
 
 	// Update the index
 	if modified {
+		tx.Defer(func() { s.kvsWatch.Notify(prefix, true) })
 		if err := tx.Insert("index", &IndexEntry{"kvs", idx}); err != nil {
 			return fmt.Errorf("failed updating index: %s", err)
 		}
 	}
 
+	tx.Commit()
+	return nil
+}
+
+// KVSLockDelay returns the expiration time for any lock delay associated with
+// the given key.
+func (s *StateStore) KVSLockDelay(key string) time.Time {
+	return s.lockDelay.GetExpiration(key)
+}
+
+// KVSLock is similar to KVSSet but only performs the set if the lock can be
+// acquired.
+func (s *StateStore) KVSLock(idx uint64, entry *structs.DirEntry) (bool, error) {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	// Verify that a session is present.
+	if entry.Session == "" {
+		return false, fmt.Errorf("Missing session")
+	}
+
+	// Verify that the session exists.
+	sess, err := tx.First("sessions", "id", entry.Session)
+	if err != nil {
+		return false, fmt.Errorf("failed session lookup: %s", err)
+	}
+	if sess == nil {
+		return false, fmt.Errorf("Invalid session %#v", entry.Session)
+	}
+
+	// Retrieve the existing entry.
+	existing, err := tx.First("kvs", "id", entry.Key)
+	if err != nil {
+		return false, fmt.Errorf("failed kvs lookup: %s", err)
+	}
+
+	// Set up the entry, using the existing entry if present.
+	if existing != nil {
+		// Bail if there's already a lock on this entry.
+		e := existing.(*structs.DirEntry)
+		if e.Session != "" {
+			return false, nil
+		}
+
+		entry.CreateIndex = e.CreateIndex
+		entry.LockIndex = e.LockIndex + 1
+	} else {
+		entry.CreateIndex = idx
+		entry.LockIndex = 1
+	}
+	entry.ModifyIndex = idx
+
+	// If we made it this far, we should perform the set.
+	if err := s.kvsSetTxn(tx, idx, entry); err != nil {
+		return false, err
+	}
+
+	tx.Commit()
+	return true, nil
+}
+
+// KVSUnlock is similar to KVSSet but only performs the set if the lock can be
+// unlocked (the key must already exist and be locked).
+func (s *StateStore) KVSUnlock(idx uint64, entry *structs.DirEntry) (bool, error) {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	// Verify that a session is present.
+	if entry.Session == "" {
+		return false, fmt.Errorf("Missing session")
+	}
+
+	// Retrieve the existing entry.
+	existing, err := tx.First("kvs", "id", entry.Key)
+	if err != nil {
+		return false, fmt.Errorf("failed kvs lookup: %s", err)
+	}
+
+	// Bail if there's no existing key.
+	if existing == nil {
+		return false, nil
+	}
+
+	// Make sure the given session is the lock holder.
+	e := existing.(*structs.DirEntry)
+	if e.Session != entry.Session {
+		return false, nil
+	}
+
+	// Clear the lock and update the entry.
+	entry.Session = ""
+	entry.LockIndex = e.LockIndex
+	entry.CreateIndex = e.CreateIndex
+	entry.ModifyIndex = idx
+
+	// If we made it this far, we should perform the set.
+	if err := s.kvsSetTxn(tx, idx, entry); err != nil {
+		return false, err
+	}
+
+	tx.Commit()
+	return true, nil
+}
+
+// KVSRestore is used when restoring from a snapshot. Use KVSSet for general
+// inserts.
+func (s *StateStore) KVSRestore(entry *structs.DirEntry) error {
+	tx := s.db.Txn(true)
+	defer tx.Abort()
+
+	if err := tx.Insert("kvs", entry); err != nil {
+		return fmt.Errorf("failed inserting kvs entry: %s", err)
+	}
+
+	if err := s.indexUpdateMaxTxn(tx, entry.ModifyIndex, "kvs"); err != nil {
+		return fmt.Errorf("failed updating index: %s", err)
+	}
+
+	tx.Defer(func() { s.kvsWatch.Notify(entry.Key, false) })
 	tx.Commit()
 	return nil
 }
@@ -1099,7 +1292,7 @@ func (s *StateStore) SessionCreate(idx uint64, sess *structs.Session) error {
 	defer tx.Abort()
 
 	// Call the session creation
-	if err := sessionCreateTxn(tx, idx, sess); err != nil {
+	if err := s.sessionCreateTxn(tx, idx, sess); err != nil {
 		return err
 	}
 
@@ -1110,7 +1303,7 @@ func (s *StateStore) SessionCreate(idx uint64, sess *structs.Session) error {
 // sessionCreateTxn is the inner method used for creating session entries in
 // an open transaction. Any health checks registered with the session will be
 // checked for failing status. Returns any error encountered.
-func sessionCreateTxn(tx *memdb.Txn, idx uint64, sess *structs.Session) error {
+func (s *StateStore) sessionCreateTxn(tx *memdb.Txn, idx uint64, sess *structs.Session) error {
 	// Check that we have a session ID
 	if sess.ID == "" {
 		return ErrMissingSessionID
@@ -1260,7 +1453,7 @@ func (s *StateStore) SessionDestroy(idx uint64, sessionID string) error {
 	defer tx.Abort()
 
 	// Call the session deletion
-	if err := sessionDestroyTxn(tx, idx, sessionID); err != nil {
+	if err := s.sessionDestroyTxn(tx, idx, sessionID); err != nil {
 		return err
 	}
 
@@ -1270,7 +1463,7 @@ func (s *StateStore) SessionDestroy(idx uint64, sessionID string) error {
 
 // sessionDestroyTxn is the inner method, which is used to do the actual
 // session deletion and handle session invalidation, watch triggers, etc.
-func sessionDestroyTxn(tx *memdb.Txn, idx uint64, sessionID string) error {
+func (s *StateStore) sessionDestroyTxn(tx *memdb.Txn, idx uint64, sessionID string) error {
 	// Look up the session
 	sess, err := tx.First("sessions", "id", sessionID)
 	if err != nil {
@@ -1299,18 +1492,17 @@ func (s *StateStore) ACLSet(idx uint64, acl *structs.ACL) error {
 	defer tx.Abort()
 
 	// Call set on the ACL
-	if err := aclSetTxn(tx, idx, acl); err != nil {
+	if err := s.aclSetTxn(tx, idx, acl); err != nil {
 		return err
 	}
 
-	tx.Defer(func() { s.GetWatchManager("acls").Notify() })
 	tx.Commit()
 	return nil
 }
 
 // aclSetTxn is the inner method used to insert an ACL rule with the
 // proper indexes into the state store.
-func aclSetTxn(tx *memdb.Txn, idx uint64, acl *structs.ACL) error {
+func (s *StateStore) aclSetTxn(tx *memdb.Txn, idx uint64, acl *structs.ACL) error {
 	// Check that the ID is set
 	if acl.ID == "" {
 		return ErrMissingACLID
@@ -1338,6 +1530,8 @@ func aclSetTxn(tx *memdb.Txn, idx uint64, acl *structs.ACL) error {
 	if err := tx.Insert("index", &IndexEntry{"acls", idx}); err != nil {
 		return fmt.Errorf("failed updating index: %s", err)
 	}
+
+	tx.Defer(func() { s.tableWatches["acls"].Notify() })
 	return nil
 }
 
@@ -1364,7 +1558,8 @@ func (s *StateStore) ACLList() (uint64, []*structs.ACL, error) {
 	return aclListTxn(tx)
 }
 
-// aclListTxn is used to list out all of the ACLs in the state store.
+// aclListTxn is used to list out all of the ACLs in the state store. This is a
+// function vs. a method so it can be called from the snapshotter.
 func aclListTxn(tx *memdb.Txn) (uint64, []*structs.ACL, error) {
 	// Query all of the ACLs in the state store
 	acls, err := tx.Get("acls", "id")
@@ -1394,18 +1589,17 @@ func (s *StateStore) ACLDelete(idx uint64, aclID string) error {
 	defer tx.Abort()
 
 	// Call the ACL delete
-	if err := aclDeleteTxn(tx, idx, aclID); err != nil {
+	if err := s.aclDeleteTxn(tx, idx, aclID); err != nil {
 		return err
 	}
 
-	tx.Defer(func() { s.GetWatchManager("acls").Notify() })
 	tx.Commit()
 	return nil
 }
 
 // aclDeleteTxn is used to delete an ACL from the state store within
 // an existing transaction.
-func aclDeleteTxn(tx *memdb.Txn, idx uint64, aclID string) error {
+func (s *StateStore) aclDeleteTxn(tx *memdb.Txn, idx uint64, aclID string) error {
 	// Look up the existing ACL
 	acl, err := tx.First("acls", "id", aclID)
 	if err != nil {
@@ -1422,6 +1616,8 @@ func aclDeleteTxn(tx *memdb.Txn, idx uint64, aclID string) error {
 	if err := tx.Insert("index", &IndexEntry{"acls", idx}); err != nil {
 		return fmt.Errorf("failed updating index: %s", err)
 	}
+
+	tx.Defer(func() { s.tableWatches["acls"].Notify() })
 	return nil
 }
 
@@ -1435,11 +1631,11 @@ func (s *StateStore) ACLRestore(acl *structs.ACL) error {
 		return fmt.Errorf("failed restoring acl: %s", err)
 	}
 
-	if err := indexUpdateMaxTxn(tx, acl.ModifyIndex, "acls"); err != nil {
-		return err
+	if err := s.indexUpdateMaxTxn(tx, acl.ModifyIndex, "acls"); err != nil {
+		return fmt.Errorf("failed updating index: %s", err)
 	}
 
-	tx.Defer(func() { s.GetWatchManager("acls").Notify() })
+	tx.Defer(func() { s.tableWatches["acls"].Notify() })
 	tx.Commit()
 	return nil
 }

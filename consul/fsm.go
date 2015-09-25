@@ -177,34 +177,34 @@ func (c *consulFSM) applyKVSOperation(buf []byte, index uint64) interface{} {
 	defer metrics.MeasureSince([]string{"consul", "fsm", "kvs", string(req.Op)}, time.Now())
 	switch req.Op {
 	case structs.KVSSet:
-		return c.state.KVSSet(index, &req.DirEnt)
+		return c.stateNew.KVSSet(index, &req.DirEnt)
 	case structs.KVSDelete:
-		return c.state.KVSDelete(index, req.DirEnt.Key)
+		return c.stateNew.KVSDelete(index, req.DirEnt.Key)
 	case structs.KVSDeleteCAS:
-		act, err := c.state.KVSDeleteCheckAndSet(index, req.DirEnt.Key, req.DirEnt.ModifyIndex)
+		act, err := c.stateNew.KVSDeleteCAS(index, req.DirEnt.ModifyIndex, req.DirEnt.Key)
 		if err != nil {
 			return err
 		} else {
 			return act
 		}
 	case structs.KVSDeleteTree:
-		return c.state.KVSDeleteTree(index, req.DirEnt.Key)
+		return c.stateNew.KVSDeleteTree(index, req.DirEnt.Key)
 	case structs.KVSCAS:
-		act, err := c.state.KVSCheckAndSet(index, &req.DirEnt)
+		act, err := c.stateNew.KVSSetCAS(index, &req.DirEnt)
 		if err != nil {
 			return err
 		} else {
 			return act
 		}
 	case structs.KVSLock:
-		act, err := c.state.KVSLock(index, &req.DirEnt)
+		act, err := c.stateNew.KVSLock(index, &req.DirEnt)
 		if err != nil {
 			return err
 		} else {
 			return act
 		}
 	case structs.KVSUnlock:
-		act, err := c.state.KVSUnlock(index, &req.DirEnt)
+		act, err := c.stateNew.KVSUnlock(index, &req.DirEnt)
 		if err != nil {
 			return err
 		} else {
@@ -338,7 +338,7 @@ func (c *consulFSM) Restore(old io.ReadCloser) error {
 			if err := dec.Decode(&req); err != nil {
 				return err
 			}
-			if err := c.state.KVSRestore(&req); err != nil {
+			if err := c.stateNew.KVSRestore(&req); err != nil {
 				return err
 			}
 
@@ -479,7 +479,7 @@ func (s *consulSnapshot) persistSessions(sink raft.SnapshotSink,
 
 func (s *consulSnapshot) persistACLs(sink raft.SnapshotSink,
 	encoder *codec.Encoder) error {
-	acls, err := s.stateNew.ACLList()
+	acls, err := s.stateNew.ACLDump()
 	if err != nil {
 		return err
 	}
@@ -495,29 +495,18 @@ func (s *consulSnapshot) persistACLs(sink raft.SnapshotSink,
 
 func (s *consulSnapshot) persistKV(sink raft.SnapshotSink,
 	encoder *codec.Encoder) error {
-	streamCh := make(chan interface{}, 256)
-	errorCh := make(chan error)
-	go func() {
-		if err := s.state.KVSDump(streamCh); err != nil {
-			errorCh <- err
-		}
-	}()
+	entries, err := s.stateNew.KVSDump()
+	if err != nil {
+		return err
+	}
 
-	for {
-		select {
-		case raw := <-streamCh:
-			if raw == nil {
-				return nil
-			}
-			sink.Write([]byte{byte(structs.KVSRequestType)})
-			if err := encoder.Encode(raw); err != nil {
-				return err
-			}
-
-		case err := <-errorCh:
+	for _, e := range entries {
+		sink.Write([]byte{byte(structs.KVSRequestType)})
+		if err := encoder.Encode(e); err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
 func (s *consulSnapshot) persistTombstones(sink raft.SnapshotSink,

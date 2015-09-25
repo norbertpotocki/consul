@@ -25,7 +25,7 @@ func stateStoreSchema() *memdb.DBSchema {
 		servicesTableSchema,
 		checksTableSchema,
 		kvsTableSchema,
-		tombstonesTableSchema,
+		func() *memdb.TableSchema { return tombstonesTableSchema("kvs") },
 		sessionsTableSchema,
 		sessionChecksTableSchema,
 		aclsTableSchema,
@@ -231,11 +231,11 @@ func kvsTableSchema() *memdb.TableSchema {
 }
 
 // tombstonesTableSchema returns a new table schema used for
-// storing tombstones during kvs delete operations to prevent
-// the index from sliding backwards.
-func tombstonesTableSchema() *memdb.TableSchema {
+// storing tombstones during the given table's delete operations
+// to prevent the index from sliding backwards.
+func tombstonesTableSchema(table string) *memdb.TableSchema {
 	return &memdb.TableSchema{
-		Name: "tombstones",
+		Name: "tombstones_" + table,
 		Indexes: map[string]*memdb.IndexSchema{
 			"id": &memdb.IndexSchema{
 				Name:         "id",
